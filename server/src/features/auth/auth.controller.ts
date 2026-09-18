@@ -10,7 +10,7 @@ import type { LoginInput, RegisterInput } from './auth.validators';
 const COOKIE_OPTIONS: CookieOptions = {
   httpOnly: true,
   secure: isProduction,
-  sameSite: 'lax',
+  sameSite: isProduction ? 'none' : 'lax',
   // Kept in lockstep with the JWT's own expiration (see accessTokenMaxAgeMs)
   // so the cookie never outlives the token, or gets dropped before it.
   maxAge: accessTokenMaxAgeMs(),
