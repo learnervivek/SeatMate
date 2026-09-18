@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Env files
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Build output
+dist/
+build/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Editor/OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local MongoDB data (dev convenience only)
+.mongo-data/
+
+# Testing / coverage
+coverage/
+
+# TypeScript
+*.tsbuildinfo

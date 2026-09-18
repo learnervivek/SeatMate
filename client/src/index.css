@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-page-bg: #fbf8f3;
+  --color-ink: #1b1712;
+  --color-accent: #c1602a;
+  --color-border: #e4ddcd;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply antialiased;
+  background-color: var(--color-page-bg);
+  color: var(--color-ink);
+}
+
+::selection {
+  background-color: theme('colors.terracotta.100');
+  color: theme('colors.ink.900');
+}
+
+:focus-visible {
+  outline: 2px solid theme('colors.terracotta.500');
+  outline-offset: 2px;
+}
