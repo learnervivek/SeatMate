@@ -90,6 +90,25 @@ export default {
         card: '0 1px 2px 0 rgba(27, 23, 18, 0.04), 0 1px 6px -2px rgba(27, 23, 18, 0.06)',
         raised: '0 8px 24px -6px rgba(27, 23, 18, 0.16)',
       },
+      keyframes: {
+        'train-travel': {
+          '0%': { transform: 'translateX(-8%)' },
+          '100%': { transform: 'translateX(108%)' },
+        },
+        'rail-shimmer': {
+          '0%, 100%': { opacity: '0.4' },
+          '50%': { opacity: '0.9' },
+        },
+        'fade-in': {
+          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+      },
+      animation: {
+        'train-travel': 'train-travel 12s linear infinite',
+        'rail-shimmer': 'rail-shimmer 2.4s ease-in-out infinite',
+        'fade-in': 'fade-in 0.3s ease-out',
+      },
     },
   },
   plugins: [],
