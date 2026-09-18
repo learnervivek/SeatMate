@@ -1,336 +1,543 @@
 # SeatMate
 
-SeatMate is a passenger seat-swapping platform for people travelling on the same train or flight.
-A user verifies a journey with a PNR, states which seat/berth type they'd actually like, and the
-app finds other verified passengers on the *same* train/flight, date, and class whose current seat
-matches what they want (and vice versa). Either side can send a swap request; the other can accept
-or reject it; accepted swaps are recorded in-app and both sides get a real-time notification over
-Socket.IO.
+SeatMate is a full-stack passenger seat-swapping platform for people travelling on the same
+train or flight. A passenger verifies a journey with a PNR, describes the seat or berth they
+would prefer, and discovers other verified passengers whose seats and preferences are mutually
+compatible.
 
-> **This is a portfolio/demo project.** PNR verification uses a small in-memory **mock dataset**
-> (`server/src/features/pnr/mockPnrData.ts`) — SeatMate is **not** connected to Indian Railways,
-> IRCTC, or any airline reservation system. An "accepted" swap only updates SeatMate's own
-> database; it does **not** change a real ticket or reservation. See
-> [architecture.md](architecture.md#mock-pnr-boundary) for how that boundary is enforced in code.
+SeatMate is a portfolio/demo application. PNR verification uses a local mock dataset; it is not
+connected to Indian Railways, IRCTC, an airline, or any live reservation provider. Accepting a
+swap updates SeatMate's database only and does not change a real ticket.
 
-## 1. Overview
+## Contents
 
-| | |
-| --- | --- |
-| **Problem** | You've booked a seat you'd rather not have (upper berth, middle seat, wrong coach) but the reservation itself is fixed. Somewhere on the same journey is another passenger with the seat you want, who wants yours. |
-| **Solution** | Verify your journey, say what seat you'd actually want, and SeatMate surfaces compatible passengers on that exact train/flight, date, and class. A swap only happens once both sides explicitly agree. |
-| **Status** | Feature-complete demo/portfolio build: auth, PNR verification, seat preferences + matching, the full swap request lifecycle, and real-time notifications are all implemented and tested end-to-end. |
+- [Product flow](#product-flow)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Repository structure](#repository-structure)
+- [Local development](#local-development)
+- [Environment variables](#environment-variables)
+- [Application flows](#application-flows)
+- [API reference](#api-reference)
+- [Data model](#data-model)
+- [Matching algorithm](#matching-algorithm)
+- [Security and reliability](#security-and-reliability)
+- [Testing](#testing)
+- [Production deployment](#production-deployment)
+- [Limitations and future work](#limitations-and-future-work)
 
-## 2. Features
+## Product flow
 
-- **Authentication** — email/password registration and login, JWT in an HTTP-only cookie (never
-  `localStorage`), session persistence across reloads, protected routes.
-- **Journey verification** — enter a PNR, get back the train/flight, route, class, and your
-  assigned seat, pulled from a clearly-labeled mock dataset.
-- **Interactive seat map** — a realistic Indian train coach (4 bays, lower/middle/upper + side
-  berths) or flight cabin layout, distinguishing your seat, available seats, seats held by
-  compatible passengers, your selected preference, and unavailable seats.
-- **Seat preferences** — state which berth type(s) you'd accept, optionally restrict to your own
-  coach or a seat-number range.
-- **Matching** — a scored, ranked list of compatible passengers on the same journey, with
-  human-readable reasons for each match (mutual want, same coach, seat range fit).
-- **Swap requests** — send, accept, reject, or cancel a request; requests expire automatically
-  after 3 days; accepting swaps both passengers' seats atomically.
-- **Real-time notifications** — a request being sent, accepted, rejected, or cancelled pushes an
-  instant Socket.IO event to the other side, backed by a persisted notification so nothing is lost
-  if they're offline.
-- **Dashboard** — current journey, preference status, compatible-passenger count, pending swap
-  activity, and recent notifications in one screen, with realistic empty states throughout.
-
-## 3. Architecture
-
-SeatMate is a two-workspace monorepo: a React/Vite frontend (`client/`) and an Express/TypeScript
-API (`server/`), both organized **by feature** (auth, journeys, preferences, swaps, notifications)
-rather than by technical layer. The API is stateless aside from MongoDB; Socket.IO runs in the same
-process and authenticates over the same JWT cookie as the REST API. There is no Redis, message
-queue, or microservice split — see [architecture.md](architecture.md) for the full breakdown,
-including the matching algorithm, MongoDB schema/index design, Socket.IO's connection model, and
-the concurrency handling behind swap acceptance.
-
+```mermaid
+flowchart LR
+    A[Create account or log in] --> B[Verify mock PNR]
+    B --> C[Journey and assigned seat]
+    C --> D[Set desired seat or berth]
+    D --> E[View compatible passengers]
+    E --> F[Send swap request]
+    F --> G[Other passenger accepts or rejects]
+    G --> H[Persist result and notify both users]
 ```
+
+The central rule is mutual consent. Matching suggests possible exchanges, but a seat changes only
+after the receiving passenger explicitly accepts a pending request.
+
+## Features
+
+- Email/password registration and login.
+- JWT sessions stored in HTTP-only cookies, never in `localStorage`.
+- PNR verification against a clearly labelled in-memory mock provider.
+- Train and flight journey support.
+- Interactive seat maps for train berths and flight seat types.
+- Seat preferences for berth/seat type, coach, and optional seat-number range.
+- Compatibility matching with scores and human-readable reasons.
+- Swap request lifecycle: pending, completed, rejected, cancelled, and expired.
+- Atomic seat swapping with MongoDB transactions.
+- Persisted notifications plus real-time Socket.IO updates.
+- Responsive authenticated dashboard with journey, matches, requests, notifications, and profile views.
+- Server-side validation, authorization, rate limiting, security headers, and structured errors.
+
+## Architecture
+
+SeatMate is a two-workspace monorepo:
+
+```text
 SeatMate/
-├── client/     # React + Vite frontend
-├── server/     # Express + TypeScript API + Socket.IO
+├── client/       React + Vite frontend
+├── server/       Express + TypeScript API and Socket.IO server
 ├── architecture.md
-└── README.md   # you are here
+├── package.json
+└── package-lock.json
 ```
 
-## 4. Database schema
+### Runtime components
 
-Five MongoDB collections (Mongoose schemas, all with `{ timestamps: true }`):
+```mermaid
+flowchart TB
+    Browser[React browser client]
+    API[Express API]
+    Socket[Socket.IO server]
+    DB[(MongoDB replica set)]
+    Mock[Mock PNR provider]
 
-**User**
-| Field | Type | Notes |
-| --- | --- | --- |
-| `name` | string | |
-| `email` | string | unique, lowercased |
-| `passwordHash` | string | bcrypt, `select: false` — never returned by default |
+    Browser -->|REST with credentials| API
+    Browser <-->|Authenticated events| Socket
+    API --> DB
+    Socket --> DB
+    API --> Mock
+    API -->|Persist notification then emit| Socket
+```
 
-**Journey** — one per verified PNR
-| Field | Type | Notes |
-| --- | --- | --- |
-| `userId` | ObjectId → User | |
-| `pnr` | string | unique — claims the PNR to one account |
-| `transportType` | `'train' \| 'flight'` | |
-| `operatorName`, `vehicleNumber`, `from`, `to`, `boardingStation`, `class` | string | |
-| `travelDate` | Date | |
-| `assignedSeat` | `{ coach?, seatNumber, berthType }` | mutated in place when a swap completes |
-| `status` | `'active' \| 'cancelled'` | |
+The frontend and backend are organized by feature rather than by a global technical layer. The
+backend uses thin controllers, validated request boundaries, and service modules containing the
+business rules. MongoDB is the source of truth for users, journeys, preferences, swap requests,
+and notifications. Socket.IO is only a live delivery channel on top of persisted notifications.
 
-**SwapPreference** — at most one per journey
-| Field | Type | Notes |
-| --- | --- | --- |
-| `journeyId` | ObjectId → Journey | unique |
-| `userId` | ObjectId → User | |
-| `currentSeat` | seat snapshot | taken when the preference is set, independent of `Journey.assignedSeat` |
-| `desiredBerthTypes` | `BerthType[]` | at least one required |
-| `sameCoach` | boolean | |
-| `preferredSeatRange` | `{ min, max }` | optional |
-| `status` | `'active' \| 'matched' \| 'cancelled'` | |
+For the deeper design rationale, indexes, transaction details, and scaling discussion, see
+[architecture.md](architecture.md).
 
-**SwapRequest** — one per swap attempt
-| Field | Type | Notes |
-| --- | --- | --- |
-| `requesterId`, `receiverId` | ObjectId → User | |
-| `requesterJourneyId`, `receiverJourneyId` | ObjectId → Journey | |
-| `requesterSeat`, `receiverSeat` | seat snapshots | taken at request-creation time, re-validated at accept time |
-| `message` | string | optional, max 280 chars |
-| `status` | `pending \| accepted \| rejected \| cancelled \| expired \| completed` | a successful accept jumps straight to `completed` |
-| `expiresAt` | Date | 3 days from creation |
+### Frontend
 
-**Notification**
-| Field | Type | Notes |
-| --- | --- | --- |
-| `userId` | ObjectId → User | |
-| `type` | `swap_request_received \| swap_request_completed \| swap_request_rejected \| swap_request_cancelled` | |
-| `title`, `message` | string | |
-| `relatedSwapRequestId` | ObjectId → SwapRequest | optional |
-| `read` | boolean | |
+The frontend is a React 18 application built with Vite, TypeScript, Tailwind CSS, React Router,
+Zustand, Axios, React Hook Form, Zod, and Socket.IO Client.
 
-Full index rationale (which query each index serves) is in
-[architecture.md § MongoDB design](architecture.md#3-mongodb-design).
+- `app/` owns route composition, authentication bootstrap, protected routes, and the application shell.
+- `components/layout/` contains the responsive navigation and page shell.
+- `components/ui/` contains reusable controls, states, and seat-map primitives.
+- `features/` contains page and API code grouped by domain.
+- `lib/` contains the configured Axios and Socket.IO clients.
+- `store/` contains global authentication, notification, and toast state.
+- `types/` contains frontend domain types aligned with API response shapes.
 
-## 5. API documentation
+The public landing page loads immediately. Authenticated pages are lazy-loaded. API calls use
+`withCredentials: true`, so the browser sends the HTTP-only session cookie automatically.
 
-All routes are prefixed `/api`. Except `/auth/register`, `/auth/login`, and `/health`, every route
-requires the auth cookie (`requireAuth` middleware) and returns `401` without it.
+### Backend
 
-**Auth**
-| Method | Route | Body | Notes |
-| --- | --- | --- | --- |
-| POST | `/auth/register` | `{ name, email, password }` | Rate-limited. Sets the session cookie. |
-| POST | `/auth/login` | `{ email, password }` | Rate-limited. Sets the session cookie. |
-| POST | `/auth/logout` | — | Clears the session cookie. |
-| GET | `/auth/me` | — | Returns the current user, or `401`. |
+The backend is an Express application running in a Node.js process:
 
-**PNR / Journeys**
-| Method | Route | Body | Notes |
-| --- | --- | --- | --- |
-| POST | `/pnr/verify` | `{ pnr }` | Rate-limited. Creates (or idempotently returns) a `Journey`. |
-| GET | `/journeys` | — | The caller's active journeys, soonest first. |
-| GET | `/journeys/:journeyId` | — | `404` if not owned by the caller. |
+- `config/` validates environment variables and connects to MongoDB.
+- `features/` contains auth, journeys, PNR, preferences, swaps, users, and notifications.
+- `middleware/` contains authentication, Zod validation, rate limiting, and error handling.
+- `lib/` contains JWT, logging, async-handler, and application-error helpers.
+- `sockets/` authenticates Socket.IO handshakes and assigns per-user rooms.
+- `test/` contains integration helpers, factories, and in-memory replica-set setup.
 
-**Preferences & matching**
-| Method | Route | Body | Notes |
-| --- | --- | --- | --- |
-| POST | `/preferences` | `{ journeyId, desiredBerthTypes, sameCoach?, preferredSeatRange? }` | Upserts — one preference per journey. |
-| GET | `/preferences/:journeyId` | — | `404` if none set, or the journey isn't the caller's. |
-| PATCH | `/preferences/:id` | any of the above fields, plus `status` | At least one field required. |
-| GET | `/preferences/:journeyId/matches` | — | Runs the matching engine; returns scored, ranked candidates. |
+## Repository structure
 
-**Swap requests**
-| Method | Route | Body | Notes |
-| --- | --- | --- | --- |
-| POST | `/swaps` | `{ requesterJourneyId, receiverJourneyId, message? }` | Rate-limited. `409` on a duplicate pending request for the same pair. |
-| GET | `/swaps/incoming` | — | Requests where the caller is the receiver. |
-| GET | `/swaps/outgoing` | — | Requests the caller sent. |
-| PATCH | `/swaps/:id/accept` | — | Receiver-only. Runs inside a MongoDB transaction. |
-| PATCH | `/swaps/:id/reject` | — | Receiver-only. |
-| PATCH | `/swaps/:id/cancel` | — | Requester-only. |
+```text
+client/src/
+├── app/                 routes and protected-route handling
+├── components/          layout and reusable UI primitives
+├── design-system/       shared visual tokens
+├── features/
+│   ├── auth/            registration and login
+│   ├── dashboard/       authenticated home screen
+│   ├── journeys/        journey display and PNR verification UI
+│   ├── landing/         public landing page
+│   ├── notifications/   notification feed and socket hook
+│   ├── pnr/             PNR API wrapper
+│   ├── preferences/     preference form and seat map
+│   ├── profile/         profile UI
+│   └── swaps/           matches and swap requests
+├── lib/                 Axios and Socket.IO clients
+├── store/               Zustand stores
+└── types/               frontend domain types
 
-**Notifications**
-| Method | Route | Body | Notes |
-| --- | --- | --- | --- |
-| GET | `/notifications` | — | Most recent 50, plus `unreadCount`. |
-| PATCH | `/notifications/:notificationId/read` | — | |
-| PATCH | `/notifications/read-all` | — | |
+server/src/
+├── config/              environment and database setup
+├── features/
+│   ├── auth/            auth routes, controller, service, validation
+│   ├── journeys/        journey model and service
+│   ├── notifications/   persisted notifications
+│   ├── pnr/             mock provider and verification boundary
+│   ├── preferences/     preferences and matching engine
+│   ├── swaps/           swap request lifecycle
+│   └── users/           user model and public DTO
+├── lib/                 errors, JWT, logging, async helpers
+├── middleware/          cross-cutting request middleware
+├── sockets/             Socket.IO setup
+├── test/                integration test infrastructure
+├── types/               server domain and Express types
+├── app.ts               Express middleware and route wiring
+└── server.ts            process bootstrap and graceful shutdown
+```
 
-**Health**
-| Method | Route | Notes |
-| --- | --- | --- |
-| GET | `/health` | Unauthenticated; `{ status: 'ok', timestamp }`. |
-
-Every error response is `{ message: string, errors?: {...} }` (validation errors include a
-per-field `errors` map); see `server/src/middleware/errorHandler.ts` for the exact mapping from
-error type to status code.
-
-## 6. Local setup
+## Local development
 
 ### Prerequisites
 
-- Node.js 20+
-- A MongoDB instance running as a **replica set** (a free MongoDB Atlas cluster already is one; a
-  local `mongod` needs `--replSet <name>` plus a one-time `rs.initiate()` — a single-node replica
-  set is enough). This is required because accepting a swap runs inside a MongoDB transaction.
+- Node.js 20 or newer.
+- npm.
+- MongoDB running as a replica set. MongoDB Atlas provides this by default. A local single-node
+  replica set is sufficient because accepting a swap uses a transaction.
 
-### Steps
+### Install
 
-1. **Install dependencies** (installs both workspaces from the repo root):
+From the repository root:
 
-   ```bash
-   npm install
-   ```
+```bash
+npm install
+cp server/.env.example server/.env
+cp client/.env.example client/.env
+```
 
-2. **Configure environment variables**:
+Set `MONGODB_URI` and a long local `JWT_SECRET` in `server/.env`. Never commit either `.env` file.
+The `.env.example` files are safe templates intended for version control.
 
-   ```bash
-   cp server/.env.example server/.env
-   cp client/.env.example client/.env
-   ```
+### Start MongoDB locally
 
-   Edit `server/.env` — at minimum set `MONGODB_URI` to your database and `JWT_SECRET` to a long
-   random string. The defaults in `client/.env.example` work as-is for local development.
+Example macOS/Homebrew commands for a single-node replica set:
 
-3. **Run both apps in dev mode**:
+```bash
+mkdir -p .mongo-data
+mongod --dbpath .mongo-data --replSet rs0 --bind_ip 127.0.0.1 --port 27017
+```
 
-   ```bash
-   npm run dev
-   ```
+In another terminal, initialize the replica set with `mongosh`:
 
-   This starts the API on `http://localhost:5000` and the client on `http://localhost:5174` (via
-   `concurrently`). Or run them separately with `npm run dev:server` / `npm run dev:client`.
+```javascript
+rs.initiate({
+  _id: 'rs0',
+  members: [{ _id: 0, host: '127.0.0.1:27017' }],
+});
+```
 
-4. **Try it out**: register two accounts (e.g. in two browser profiles), and verify PNRs from the
-   mock dataset that share the same train/flight, date, and class so they can match each other, for
-   example:
+Use this connection string for a local database:
 
-   | PNR | Train | Date | Class | Seat |
-   | --- | --- | --- | --- | --- |
-   | `2458761023` | Rajdhani Express 12301 | 2026-10-05 | 3A | B4/32 (side-upper) |
-   | `2458761024` | Rajdhani Express 12301 | 2026-10-05 | 3A | B4/18 (lower) |
+```text
+mongodb://127.0.0.1:27017/seatmate?replicaSet=rs0
+```
 
-   Full list in [server/src/features/pnr/mockPnrData.ts](server/src/features/pnr/mockPnrData.ts).
+### Start the application
 
-### Scripts (root)
+Run both workspaces from the root:
 
-| Command | Description |
-| --- | --- |
-| `npm run dev` | Run API + client together |
-| `npm run build` | Build both workspaces for production |
-| `npm run lint` | Lint both workspaces |
-| `npm run test` | Run the server's test suite (Vitest) |
-| `npm run format` | Format the repo with Prettier |
+```bash
+npm run dev
+```
 
-Each workspace also exposes its own `dev`, `build`, `lint`, and `typecheck` scripts.
+Or run them independently:
 
-## 7. Environment variables
+```bash
+npm run dev:server
+npm run dev:client
+```
 
-**`server/.env`** (see `server/.env.example` / `server/.env.production.example`)
+The default development URLs are:
 
-| Variable | Description |
-| --- | --- |
-| `NODE_ENV` | `development` \| `test` \| `production`. Gates secure cookies, Helmet, and test-only rate-limit bypass. |
-| `PORT` | API port. |
-| `CLIENT_ORIGIN` | The frontend's exact origin — drives CORS and must match for cookies to work. |
-| `MONGODB_URI` | MongoDB connection string. Must point at a replica set. |
-| `JWT_SECRET` | Signing secret for session JWTs. Long and random in every real environment. |
-| `JWT_EXPIRES_IN` | Session lifetime (e.g. `7d`). Also sets the cookie's `maxAge` in lockstep. |
-| `COOKIE_NAME` | Name of the session cookie. |
-| `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX` | Generic API rate limit (login, registration, and PNR/swap endpoints have their own tighter, hardcoded limits — see `middleware/rateLimiter.ts`). |
+| Service      | URL                                |
+| ------------ | ---------------------------------- |
+| Frontend     | `http://localhost:5174`            |
+| API          | `http://localhost:5000`            |
+| Health check | `http://localhost:5000/api/health` |
 
-**`client/.env`** (see `client/.env.example` / `client/.env.production.example`)
+If port `5000` is occupied, set `PORT=5001` in `server/.env` and update both client URLs to
+`http://localhost:5001`.
 
-| Variable | Description |
-| --- | --- |
-| `VITE_API_URL` | The API's base URL, including `/api`. |
-| `VITE_SOCKET_URL` | The API's origin for the Socket.IO connection (no `/api` suffix). |
+### Useful commands
 
-## 8. Testing
+| Command                       | Purpose                                         |
+| ----------------------------- | ----------------------------------------------- |
+| `npm run dev`                 | Run client and server together                  |
+| `npm run dev:client`          | Run only the Vite client                        |
+| `npm run dev:server`          | Run only the API with `tsx watch`               |
+| `npm run build`               | Build server and client                         |
+| `npm run lint`                | Lint both workspaces with zero warnings allowed |
+| `npm run test`                | Run the server Vitest suite                     |
+| `npm run format`              | Format tracked project files with Prettier      |
+| `npm run format:check`        | Check formatting without changing files         |
+| `npm run typecheck -w client` | Type-check the frontend                         |
+| `npm run typecheck -w server` | Type-check the backend                          |
 
-The server has a full Vitest suite — unit, integration/API, and real Socket.IO tests — run with
-`npm run test -w server` (or `npm run test` from the repo root). No external MongoDB is required:
-`globalSetup` boots an in-memory **replica set** (`mongodb-memory-server`'s `MongoMemoryReplSet`,
-not a standalone server) once for the whole run, specifically so the swap-accept flow's MongoDB
-transaction is exercised for real rather than mocked.
+## Environment variables
 
-| File | Covers |
-| --- | --- |
-| `features/auth/auth.service.test.ts` | Registration (password hashing, duplicate email), login (correct/incorrect credentials, user enumeration safety), JWT expiration/forgery. |
-| `features/pnr/pnr.service.test.ts` | Mock PNR lookup, journey creation from a PNR, idempotent re-verification, claiming an already-claimed PNR, unknown PNR. |
-| `features/preferences/matching.test.ts` | The pure scoring engine — mutual-want bonus, same-coach bonus, seat-range bonus, hard filters. |
-| `features/swaps/swap.service.test.ts` | Create/accept/reject/cancel, authorization (only the receiver can accept/reject, only the requester can cancel), an already-completed swap, an expired request, **two users requesting the same passenger** (the loser is auto-cancelled on accept), and **concurrent accept** (fired as two simultaneous calls — exactly one succeeds, seats swap exactly once). |
-| `test/api.integration.test.ts` | The same flows over real HTTP (`supertest` against `createApp()`), plus authorization (`404`/`403` on other users' resources), validation (`422`), duplicate requests (`409`), and expired-session handling (`401`). |
-| `test/socket.integration.test.ts` | A real `socket.io-client` connected to a real `http.Server` + `initSocketServer(...)`, asserting request/accept/reject each deliver the correct event to the correct user's socket. |
+### Server
 
-This also covers every edge case the project explicitly calls for: duplicate swap requests, expired
-requests, a user attempting to accept their own request, an already-completed swap, an unavailable
-(cancelled) journey, an invalid PNR, expired authentication, and concurrent swap acceptance.
+See [server/.env.example](server/.env.example) and
+[server/.env.production.example](server/.env.production.example).
 
-The client is verified through `npm run typecheck -w client` and `npm run lint -w client`, plus
-manual cross-viewport (mobile/tablet/desktop) and keyboard-navigation passes — there is no
-component/E2E test runner configured on the frontend yet (see
-[Future improvements](#11-future-improvements)).
+| Variable               | Description                                               |
+| ---------------------- | --------------------------------------------------------- |
+| `NODE_ENV`             | `development`, `test`, or `production`                    |
+| `PORT`                 | API listening port                                        |
+| `CLIENT_ORIGIN`        | Exact frontend origin used by CORS                        |
+| `MONGODB_URI`          | MongoDB replica-set connection string                     |
+| `JWT_SECRET`           | At least 16 characters; use a unique secret in production |
+| `JWT_EXPIRES_IN`       | JWT and cookie lifetime, such as `7d`                     |
+| `COOKIE_NAME`          | HTTP-only session cookie name                             |
+| `RATE_LIMIT_WINDOW_MS` | General rate-limit window                                 |
+| `RATE_LIMIT_MAX`       | General rate-limit request limit                          |
 
-## 9. Deployment
+### Client
 
-SeatMate deploys as two independent pieces — a static frontend build and a Node API — which can
-run on the same host behind a reverse proxy or on two separate platforms (e.g. a static host for
-`client/dist` and a small VM/PaaS instance for the API):
+See [client/.env.example](client/.env.example) and
+[client/.env.production.example](client/.env.production.example).
 
-1. **Database.** Provision a MongoDB replica set (a MongoDB Atlas free/shared cluster already is
-   one). Transactions will fail against a standalone `mongod`.
-2. **API.** `npm run build -w server` compiles TypeScript to `server/dist`; run it with
-   `npm run start -w server` (`node dist/server.js`). Set the environment variables from
-   `server/.env.production.example` — a real `MONGODB_URI`, a freshly generated `JWT_SECRET`, and
-   `CLIENT_ORIGIN` set to the frontend's real deployed origin (required for CORS and for cookies to
-   be accepted cross-site). `NODE_ENV=production` is what turns on `secure` cookies (HTTPS-only) and
-   the full Helmet/CORS/rate-limit posture already active in every environment.
-3. **Frontend.** `npm run build -w client` produces a static `client/dist` — serve it from any
-   static host or CDN. Set `VITE_API_URL`/`VITE_SOCKET_URL` (from
-   `client/.env.production.example`) to the deployed API's real origin **before building** — Vite
-   inlines these at build time, so changing them requires a rebuild, not just a redeploy.
-4. **HTTPS.** Both the API and frontend should be served over HTTPS in production — required for
-   `secure` cookies to actually be sent, and for the Socket.IO connection's `withCredentials` to
-   work cross-site.
+| Variable          | Description                              |
+| ----------------- | ---------------------------------------- |
+| `VITE_API_URL`    | API base URL including `/api`            |
+| `VITE_SOCKET_URL` | API origin for Socket.IO, without `/api` |
 
-There is no Docker/CI/CD configuration in this repository — see
-[Future improvements](#11-future-improvements).
+Vite embeds client environment values at build time. Changing them after a production build has
+no effect until the client is rebuilt.
 
-## 10. Limitations
+## Application flows
 
-Stated plainly, as a portfolio project should:
+### Authentication flow
 
-- **Mock PNR data only.** There is no integration with Indian Railways, IRCTC, or any airline's
-  real reservation system — see the [Mock PNR boundary](architecture.md#mock-pnr-boundary).
-- **Application-level swaps only.** Accepting a swap updates SeatMate's own database; it does not
-  and cannot modify a real ticket or reservation.
-- **Single-process architecture.** No Redis, no horizontal scaling story yet — see
-  [architecture.md § Why Redis is not currently used](architecture.md#7-why-redis-is-not-currently-used).
-- **No password reset / email verification flow.** Registration and login only; there's no
-  transactional email sending configured.
-- **No automated frontend tests.** The client is covered by TypeScript + ESLint + manual
-  cross-viewport/accessibility review, not an automated component or E2E suite.
-- **English-only, no i18n.**
-- **No admin/moderation tooling.** There's no way to remove abusive content or ban a user short of
-  direct database access.
+1. The user submits registration or login credentials.
+2. The server validates the body with Zod and hashes or compares the password with bcrypt.
+3. The server signs a JWT containing the user id and email.
+4. The JWT is set in an HTTP-only cookie. It is never returned for client-side storage.
+5. On startup, the client calls `GET /api/auth/me` to restore the session.
+6. `ProtectedRoute` waits for that result before showing authenticated content.
 
-## 11. Future improvements
+### PNR and journey flow
 
-- Add a component/E2E test layer for the frontend (Vitest + Testing Library, or Playwright for the
-  full swap flow across two simulated users).
-- Password reset and email verification (would need a transactional email provider).
-- Optional push notifications (web push) for users who've closed the tab.
-- Multi-passenger PNRs: currently only the first passenger on a PNR is treated as "the verifying
-  user"; co-passengers are read but never modeled as separate journeys.
-- Redis-backed Socket.IO adapter and rate-limit store, once/if the backend needs more than one
-  instance — see [architecture.md § When Redis would be introduced](architecture.md#8-when-redis-would-be-introduced).
-- CI (typecheck/lint/test on every PR) and a Dockerfile for the API.
+1. The user submits a PNR from the journey screen.
+2. `PNRService` looks it up in `server/src/features/pnr/mockPnrData.ts`.
+3. The server persists the journey and assigned-seat snapshot for the authenticated user.
+4. A unique PNR constraint prevents another account from claiming the same PNR.
+5. The resulting journey powers the seat map, preference form, and matching queries.
+
+The provider is deliberately isolated behind a service boundary. Replacing the mock provider with
+a real provider would not require changing controllers or frontend code, but real reservation
+integration is outside this project.
+
+### Matching flow
+
+1. The user saves an active preference for a journey.
+2. The server loads other active journeys with the same transport, vehicle, date, and class.
+3. Only passengers with their own active preferences are considered swap candidates.
+4. Hard filters remove incompatible berth types and, when requested, different coaches.
+5. Remaining candidates receive a score and explanations.
+6. The UI displays the ranked results; no seat is changed during matching.
+
+### Swap acceptance flow
+
+```mermaid
+sequenceDiagram
+    participant A as Passenger A
+    participant API as Express API
+    participant DB as MongoDB transaction
+    participant B as Passenger B
+    participant S as Socket.IO
+
+    A->>API: POST /api/swaps
+    API->>DB: Create pending request and notification
+    API-->>A: Request created
+    DB-->>S: Persisted notification is emitted
+    S-->>B: notification:new
+    B->>API: PATCH /api/swaps/:id/accept
+    API->>DB: Re-check request and both current seats
+    API->>DB: Swap seats, complete request, cancel conflicts
+    DB-->>API: Commit transaction
+    API->>DB: Persist completion notification
+    DB-->>S: Emit completion notification
+    S-->>A: notification:new
+```
+
+The acceptance transaction re-checks the request status and live seat values. This prevents two
+concurrent accept operations from swapping seats twice or accepting a stale request. Requests
+expire lazily when listed or acted on; there is no background job in this demo.
+
+### Notification flow
+
+Notifications are written to MongoDB before they are emitted through Socket.IO. The client loads
+the persisted feed on connect and reconnect, then appends live `notification:new` events to the
+Zustand notification store. A disconnected client therefore catches up from the database when it
+reconnects.
+
+## API reference
+
+All endpoints are prefixed with `/api`. JSON errors use this shape:
+
+```json
+{
+  "message": "Human-readable error",
+  "errors": { "field": ["Optional validation details"] }
+}
+```
+
+Except registration, login, and health, endpoints require the HTTP-only auth cookie.
+
+### Health
+
+| Method | Route         | Auth | Description                           |
+| ------ | ------------- | ---- | ------------------------------------- |
+| GET    | `/api/health` | No   | Returns `{ status: "ok", timestamp }` |
+
+### Authentication
+
+| Method | Route                | Body                        | Description                |
+| ------ | -------------------- | --------------------------- | -------------------------- |
+| POST   | `/api/auth/register` | `{ name, email, password }` | Create account and session |
+| POST   | `/api/auth/login`    | `{ email, password }`       | Log in and set session     |
+| POST   | `/api/auth/logout`   | None                        | Clear session cookie       |
+| GET    | `/api/auth/me`       | None                        | Return current user        |
+
+### PNR and journeys
+
+| Method | Route                      | Body      | Description                             |
+| ------ | -------------------------- | --------- | --------------------------------------- |
+| POST   | `/api/pnr/verify`          | `{ pnr }` | Verify mock PNR and create journey      |
+| GET    | `/api/journeys`            | None      | List the current user's active journeys |
+| GET    | `/api/journeys/:journeyId` | None      | Read an owned journey                   |
+
+### Preferences and matching
+
+| Method | Route                                 | Body                                            | Description                         |
+| ------ | ------------------------------------- | ----------------------------------------------- | ----------------------------------- |
+| POST   | `/api/preferences`                    | Journey id, desired types, optional coach/range | Create or replace preference        |
+| GET    | `/api/preferences/:journeyId`         | None                                            | Read preference for a journey       |
+| PATCH  | `/api/preferences/:id`                | Preference fields and/or status                 | Update preference                   |
+| GET    | `/api/preferences/:journeyId/matches` | None                                            | Return ranked compatible passengers |
+
+### Swaps
+
+| Method | Route                   | Body                                                  | Description                        |
+| ------ | ----------------------- | ----------------------------------------------------- | ---------------------------------- |
+| POST   | `/api/swaps`            | `{ requesterJourneyId, receiverJourneyId, message? }` | Send request                       |
+| GET    | `/api/swaps/incoming`   | None                                                  | List received requests             |
+| GET    | `/api/swaps/outgoing`   | None                                                  | List sent requests                 |
+| PATCH  | `/api/swaps/:id/accept` | None                                                  | Receiver accepts; runs transaction |
+| PATCH  | `/api/swaps/:id/reject` | None                                                  | Receiver rejects                   |
+| PATCH  | `/api/swaps/:id/cancel` | None                                                  | Requester cancels                  |
+
+### Notifications
+
+| Method | Route                                     | Body | Description                                  |
+| ------ | ----------------------------------------- | ---- | -------------------------------------------- |
+| GET    | `/api/notifications`                      | None | Return recent notifications and unread count |
+| PATCH  | `/api/notifications/:notificationId/read` | None | Mark one notification read                   |
+| PATCH  | `/api/notifications/read-all`             | None | Mark all notifications read                  |
+
+## Data model
+
+All five Mongoose models use timestamps.
+
+| Collection       | Purpose                                     | Important constraints                                      |
+| ---------------- | ------------------------------------------- | ---------------------------------------------------------- |
+| `User`           | Account identity and password hash          | Unique lowercased email; password hash excluded by default |
+| `Journey`        | Verified PNR and current assigned seat      | Unique PNR; belongs to one user                            |
+| `SwapPreference` | Desired seat types and matching constraints | One preference per journey                                 |
+| `SwapRequest`    | One swap attempt and its lifecycle          | Partial unique index prevents duplicate pending pair       |
+| `Notification`   | Durable user notifications                  | Indexed by user and creation time                          |
+
+### Domain values
+
+- Transport types: `train`, `flight`.
+- Train seat types: `lower`, `middle`, `upper`, `side-lower`, `side-upper`.
+- Flight seat types: `window`, `middle`, `aisle`.
+- Journey statuses: `active`, `cancelled`.
+- Preference statuses: `active`, `matched`, `cancelled`.
+- Swap statuses: `pending`, `rejected`, `cancelled`, `expired`, `completed`.
+- Notification types: received, completed, rejected, and cancelled swap events.
+
+## Matching algorithm
+
+The pure matching engine lives in `server/src/features/preferences/matching.ts`; database access
+lives in `matching.service.ts`.
+
+| Signal                               | Points | Behavior             |
+| ------------------------------------ | -----: | -------------------- |
+| Candidate has a desired type         |     40 | Required base signal |
+| Candidate wants the caller's type    |     35 | Mutual-want bonus    |
+| Same coach                           |     15 | Convenience bonus    |
+| Candidate seat is in requested range |     10 | Optional range bonus |
+
+Scores are capped at 100. Different coaches are removed when `sameCoach` is enabled. A match is
+only a recommendation; it does not reserve a seat.
+
+## Security and reliability
+
+- Passwords use bcrypt and are never exposed in API responses.
+- JWTs use HTTP-only cookies and are verified by both REST middleware and Socket.IO handshake middleware.
+- CORS allows only the configured `CLIENT_ORIGIN` and credentials are enabled for cookies.
+- Helmet supplies common HTTP security headers.
+- Request bodies and route parameters are validated with Zod at the API boundary.
+- General and sensitive-route rate limits protect authentication, PNR, and swap actions.
+- Controllers are wrapped with async error handling and a centralized error middleware.
+- User-owned resources are checked before they are returned or mutated.
+- MongoDB transactions protect the multi-document swap acceptance path.
+- A partial unique index protects against duplicate pending requests during races.
+
+The current deployment is intentionally single-process. Redis is not required until the API is
+scaled horizontally; at that point it would be needed for Socket.IO room delivery and shared rate
+limits. More design details are in [architecture.md](architecture.md).
+
+## Testing
+
+Run the backend suite with:
+
+```bash
+npm test
+# or
+npm run test -w server
+```
+
+The server tests use Vitest and `mongodb-memory-server`'s in-memory replica set, so transaction
+behavior is exercised without requiring a developer MongoDB instance.
+
+| Test area          | Coverage                                                                      |
+| ------------------ | ----------------------------------------------------------------------------- |
+| Auth service       | Registration, hashing, duplicate email, login, JWT expiry and forgery         |
+| PNR service        | Lookup, journey creation, idempotency, claimed and unknown PNRs               |
+| Matching engine    | Hard filters, score signals, ranking, and explanations                        |
+| Swap service       | Create, accept, reject, cancel, expiry, authorization, conflicts, concurrency |
+| API integration    | Real HTTP requests, validation, authorization, duplicate and expired cases    |
+| Socket integration | Real Socket.IO clients and user-scoped notification delivery                  |
+
+The client currently relies on TypeScript, ESLint, and manual responsive/accessibility checks;
+there is no automated frontend component or browser E2E suite yet.
+
+## Production deployment
+
+SeatMate deploys as a static frontend plus a Node API.
+
+1. Provision MongoDB Atlas or another MongoDB replica set.
+2. Configure the server variables from `server/.env.production.example`.
+3. Build the API with `npm run build -w server`.
+4. Start the API with `npm run start -w server`.
+5. Configure `CLIENT_ORIGIN` to the exact deployed frontend origin.
+6. Configure the client production variables before building.
+7. Build the static client with `npm run build -w client`.
+8. Serve `client/dist` from a static host or CDN.
+9. Use HTTPS for both applications so secure cookies and cross-origin Socket.IO work correctly.
+
+Production checklist:
+
+- Use a fresh, high-entropy `JWT_SECRET`.
+- Never commit `.env` files or database credentials.
+- Confirm the database supports transactions.
+- Confirm API CORS origin exactly matches the frontend URL.
+- Confirm the frontend API and Socket.IO URLs were embedded before the build.
+- Add a reverse proxy or platform health check for `/api/health`.
+
+There is currently no Dockerfile or CI/CD workflow in this repository.
+
+## Limitations and future work
+
+Current limitations:
+
+- PNR data is mock data only.
+- A completed swap changes only SeatMate's local record.
+- The server is single-process and has no Redis adapter.
+- There is no password reset or email verification.
+- There are no automated frontend or browser E2E tests.
+- The product is English-only.
+- There is no admin moderation interface.
+
+Possible next steps:
+
+- Add a real PNR provider adapter where legally and operationally appropriate.
+- Add frontend component and Playwright E2E coverage.
+- Add password reset, email verification, and web push notifications.
+- Add multi-passenger PNR modeling.
+- Add Redis-backed Socket.IO and rate-limit stores when horizontally scaling.
+- Add CI checks, Docker support, observability, and deployment manifests.
 
 ## License
 
-This is a personal/portfolio project; no license has been chosen yet.
+This is a personal/portfolio project. No license has been selected yet.
