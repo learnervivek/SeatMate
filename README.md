@@ -494,17 +494,52 @@ there is no automated frontend component or browser E2E suite yet.
 
 ## Production deployment
 
-SeatMate deploys as a static frontend plus a Node API.
+SeatMate deploys as two services. Vercel hosts the static React frontend; the Express and
+Socket.IO backend must run on a persistent Node.js host such as Render, Railway, Fly.io, or a VM.
+Vercel serverless functions are not a drop-in replacement for this backend because Socket.IO
+requires a long-lived process and swap acceptance uses MongoDB transactions.
 
 1. Provision MongoDB Atlas or another MongoDB replica set.
-2. Configure the server variables from `server/.env.production.example`.
-3. Build the API with `npm run build -w server`.
-4. Start the API with `npm run start -w server`.
-5. Configure `CLIENT_ORIGIN` to the exact deployed frontend origin.
-6. Configure the client production variables before building.
-7. Build the static client with `npm run build -w client`.
-8. Serve `client/dist` from a static host or CDN.
-9. Use HTTPS for both applications so secure cookies and cross-origin Socket.IO work correctly.
+2. Deploy the `server/` workspace to a persistent Node.js host.
+3. Configure the server variables from `server/.env.production.example`, including the Atlas
+  `MONGODB_URI`, a new `JWT_SECRET`, and the Vercel frontend URL as `CLIENT_ORIGIN`.
+4. Use `npm install` as the install command, `npm run build` as the build command, and
+  `npm run start` as the start command when the host's root directory is `server/`.
+5. Create a Vercel project from this repository with `client/` as the **Root Directory**.
+6. Vercel will use `client/vercel.json`, run `npm run build`, and publish `dist/`.
+7. Add these Vercel environment variables before deploying:
+  `VITE_API_URL=https://your-api.example/api` and
+  `VITE_SOCKET_URL=https://your-api.example`.
+8. Use HTTPS for both applications so secure cookies and cross-origin Socket.IO work correctly.
+
+### Vercel settings
+
+When importing the repository into Vercel:
+
+| Setting | Value |
+| --- | --- |
+| Root Directory | `client` |
+| Framework preset | `Vite` |
+| Build command | `npm run build` |
+| Output directory | `dist` |
+| Install command | `npm install` |
+
+The `client/vercel.json` rewrite sends unknown paths to `index.html`, which is required for
+React Router routes such as `/dashboard` and `/profile` to work after a page refresh.
+
+### Backend settings
+
+Configure these environment variables on the backend host, never in Git or Vercel:
+
+```text
+NODE_ENV=production
+CLIENT_ORIGIN=https://your-project.vercel.app
+MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/seatmate?retryWrites=true&w=majority
+JWT_SECRET=<new-long-random-secret>
+```
+
+The backend host must expose its public URL over HTTPS. Add that exact URL to the Vercel client
+variables as `VITE_API_URL` with `/api` appended and as `VITE_SOCKET_URL` without `/api`.
 
 Production checklist:
 
