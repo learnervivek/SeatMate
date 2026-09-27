@@ -6,16 +6,21 @@ import { initSocketServer } from './sockets';
 import { logger } from './lib/logger';
 
 async function main(): Promise<void> {
-  await connectDatabase();
-
   const app = createApp();
   const httpServer = http.createServer(app);
 
   initSocketServer(httpServer);
 
-  httpServer.listen(env.PORT, () => {
-    logger.info(`SeatMate API listening on port ${env.PORT} (${env.NODE_ENV})`);
+  // Start listening immediately so Render's health check passes
+  // DB connection happens after — routes will return 503 until ready
+  await new Promise<void>((resolve) => {
+    httpServer.listen(env.PORT, () => {
+      logger.info(`SeatMate API listening on port ${env.PORT} (${env.NODE_ENV})`);
+      resolve();
+    });
   });
+
+  await connectDatabase();
 
   const shutdown = (signal: string): void => {
     logger.info(`Received ${signal}, shutting down gracefully`);
